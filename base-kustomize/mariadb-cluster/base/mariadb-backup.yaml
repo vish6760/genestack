@@ -30,4 +30,14 @@ spec:
       cpu: 300m
       memory: 512Mi
   affinity:
-    antiAffinityEnabled: true
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchExpressions:
+                - key: app.kubernetes.io/instance
+                  operator: In
+                  values:
+                    - mariadb-cluster
+            topologyKey: kubernetes.io/hostname
