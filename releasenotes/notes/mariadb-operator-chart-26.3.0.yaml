@@ -6,9 +6,9 @@ prelude: |
   Upgrade path:
       0.38.1 → 25.8.4 → 25.10.4 → 26.3.0
 
-  The intermediate step 25.10.3 is not required, as 25.10.4 is the latest
-  patch release in the 25.10.x series and includes all prior fixes along
-  with additional stability improvements.
+  The version 25.8.4 and 25.10.4 is the latest patch release in the 25.8.x and
+  25.10.x series and includes all prior fixes along with additional stability
+  improvements.
 
   This upgrade introduces improvements to replication failover behaviour,
   backup and restore capabilities, operator stability, and compatibility
