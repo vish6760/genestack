@@ -1262,6 +1262,24 @@ resolve_chart_version() {
 
 # ── Helm Repo Resolution ────────────────────────────────────────────────────
 
+resolve_service_chart() {
+    local config_name="$1"
+    local SERVICE_CONFIG HELM_REPO_URL HELM_REPO_NAME SERVICE_NAME
+
+    SERVICE_CONFIG=$(load_service_config "$config_name") || return 1
+    HELM_REPO_URL=$(yq e '.chart.repo_url // ""' - <<< "$SERVICE_CONFIG") || return 1
+    HELM_REPO_NAME=$(yq e '.chart.repo_name // ""' - <<< "$SERVICE_CONFIG") || return 1
+    SERVICE_NAME=$(yq e '.chart.service_name // .service.name // ""' - <<< "$SERVICE_CONFIG") || return 1
+
+    if [[ -z "$SERVICE_NAME" ||
+          ( -n "$HELM_REPO_URL" && "$HELM_REPO_URL" != oci://* && -z "$HELM_REPO_NAME" ) ]]; then
+        log_error "Incomplete chart metadata for $config_name"
+        return 1
+    fi
+
+    resolve_helm_repo "$HELM_REPO_URL" "$HELM_REPO_NAME" "$SERVICE_NAME"
+}
+
 resolve_helm_repo() {
     local repo_url="$1"
     local repo_name="$2"
@@ -1287,6 +1305,7 @@ resolve_helm_repo() {
         HELM_CHART_PATH="$repo_url"
         log_info "OCI chart path: ${HELM_CHART_PATH}"
     else
+        log_info "Helm repo URL: ${repo_url}"
         helm repo add --force-update "$repo_name" "$repo_url" 2>/dev/null || true
         helm repo update --timeout 120s 2>/dev/null || true
         HELM_CHART_PATH="${repo_name}/${service_name}"
@@ -1297,64 +1316,74 @@ resolve_helm_repo() {
 # ── Helm Args Building ──────────────────────────────────────────────────────
 
 build_helm_args() {
-    # Reads service config and builds array of -f arguments from:
-    #   base-overrides → global-overrides → custom-overrides
-    #
-    # The service config YAML must contain .chart.service_name.
-    #
-    # Returns: prints alternating "-f" and "<path>" tokens per line for the
-    # caller to consume without shell word-splitting.
+    # Usage: build_helm_args <service_name> [additional_base_values_file...]
+    # Populates overrides_args in base, global, custom order.
+    local service_name="${1:-}"
+    if [[ -z "$service_name" ]]; then
+        log_error "Service name is required to build Helm values arguments."
+        return 1
+    fi
+    shift
 
-    local svc_yaml_content="$1"
-    local service_name
-    service_name=$(echo "$svc_yaml_content" | yq e '.chart.service_name // .service.name' -)
-    : "${service_name:=$1}"  # fallback: pass service name directly
-
+    local service_config global_overrides file
     local base_dir="${GENESTACK_BASE_DIR}/base-helm-configs/${service_name}"
     local global_dir="${GENESTACK_OVERRIDES_DIR}/helm-configs/global_overrides"
     local custom_dir="${GENESTACK_OVERRIDES_DIR}/helm-configs/${service_name}"
-    local global_enabled
-    local raw_val
-    raw_val=$(echo "$svc_yaml_content" | yq e '.chart.global_overrides' -)
-    if [[ "$raw_val" == "false" ]]; then
-        global_enabled="false"
-    else
-        global_enabled="true"
-    fi
 
-    # Base overrides
+    service_config=$(load_service_config "$service_name") || return 1
+    global_overrides=$(yq e '.chart.global_overrides' - <<< "$service_config") || return 1
+
+    overrides_args=()
+
     if [[ -d "$base_dir" ]]; then
-        for f in "$base_dir"/*.yaml; do
-            if [[ -f "$f" ]]; then
-                echo "-f"
-                echo "$f"
+        echo "Including base overrides from directory: $base_dir"
+        for file in "$base_dir"/*.yaml; do
+            if [[ -f "$file" ]]; then
+                echo " - $file"
+                overrides_args+=("-f" "$file")
             fi
         done
     else
         log_warn "Base override directory not found: $base_dir"
     fi
 
-    # Global overrides
-    if [[ "$global_enabled" == "true" && -d "$global_dir" ]]; then
-        for f in "$global_dir"/*.yaml; do
-            if [[ -f "$f" ]]; then
-                echo "-f"
-                echo "$f"
-            fi
-        done
+    # Installer-specific base files, such as Neutron TLS values or
+    # Kube Prometheus Stack rules, retain their position before global values.
+    for file in "$@"; do
+        if [[ -f "$file" ]]; then
+            echo " - $file"
+            overrides_args+=("-f" "$file")
+        fi
+    done
+
+    # As today, an unset flag includes global values; false skips them.
+    if [[ "$global_overrides" != "false" ]]; then
+        if [[ -d "$global_dir" ]]; then
+            echo "Including global overrides from directory: $global_dir"
+            for file in "$global_dir"/*.yaml; do
+                if [[ -f "$file" ]]; then
+                    echo " - $file"
+                    overrides_args+=("-f" "$file")
+                fi
+            done
+        else
+            log_warn "Global override directory not found: $global_dir"
+        fi
     fi
 
-    # Custom overrides
     if [[ -d "$custom_dir" ]]; then
-        for f in "$custom_dir"/*.yaml; do
-            if [[ -f "$f" ]]; then
-                echo "-f"
-                echo "$f"
+        echo "Including overrides from service config directory: $custom_dir"
+        for file in "$custom_dir"/*.yaml; do
+            if [[ -f "$file" ]]; then
+                echo " - $file"
+                overrides_args+=("-f" "$file")
             fi
         done
     else
         log_warn "Service config directory not found: $custom_dir"
     fi
+
+    echo
 }
 
 # ── Secret Management ───────────────────────────────────────────────────────
