@@ -11,10 +11,6 @@ SERVICE_NAMESPACE="monitoring"
 
 source "$(dirname "$0")/monitoring-common.sh"
 
-# Helm
-HELM_REPO_NAME_DEFAULT="grafana"
-HELM_REPO_URL_DEFAULT="https://grafana.github.io/helm-charts"
-
 # Base directories provided by the environment
 GENESTACK_BASE_DIR="${GENESTACK_BASE_DIR:-/opt/genestack}"
 GENESTACK_OVERRIDES_DIR="${GENESTACK_OVERRIDES_DIR:-/etc/genestack}"
@@ -24,13 +20,6 @@ GENESTACK_OVERRIDES_DIR="${GENESTACK_OVERRIDES_DIR:-/etc/genestack}"
 # shellcheck source=helpers.sh
 source "${GENESTACK_BASE_DIR}/bin/helpers.sh"
 trap cleanup_tmp EXIT
-
-# Define service-specific override directories based on the framework
-SERVICE_BASE_OVERRIDES="${GENESTACK_BASE_DIR}/base-helm-configs/${SERVICE_NAME_DEFAULT}"
-SERVICE_CUSTOM_OVERRIDES="${GENESTACK_OVERRIDES_DIR}/helm-configs/${SERVICE_NAME_DEFAULT}"
-
-# Define the Global Overrides directory used in the original script
-GLOBAL_OVERRIDES_DIR="${GENESTACK_OVERRIDES_DIR}/helm-configs/global_overrides"
 
 monitoring_ensure_namespace "${SERVICE_NAMESPACE}"
 monitoring_label_namespace_for_talos "${SERVICE_NAMESPACE}"
@@ -53,87 +42,9 @@ fi
 
 echo "Found version for $SERVICE_NAME_DEFAULT: $SERVICE_VERSION"
 
-# Load chart metadata from custom override YAML if defined
-for yaml_file in "${SERVICE_CUSTOM_OVERRIDES}"/*.yaml; do
-    if [ -f "$yaml_file" ]; then
-        HELM_REPO_URL=$(yq eval '.chart.repo_url // ""' "$yaml_file")
-        HELM_REPO_NAME=$(yq eval '.chart.repo_name // ""' "$yaml_file")
-        SERVICE_NAME=$(yq eval '.chart.service_name // ""' "$yaml_file")
-        break  # use the first match and stop
-    fi
-done
+resolve_service_chart "$SERVICE_NAME_DEFAULT" || exit 1
 
-# Fallback to defaults if variables not set
-: "${HELM_REPO_URL:=$HELM_REPO_URL_DEFAULT}"
-: "${HELM_REPO_NAME:=$HELM_REPO_NAME_DEFAULT}"
-: "${SERVICE_NAME:=$SERVICE_NAME_DEFAULT}"
-
-
-# Determine Helm chart path
-if [[ "$HELM_REPO_URL" == oci://* ]]; then
-    # OCI registry path
-    HELM_CHART_PATH="$HELM_REPO_URL/$HELM_REPO_NAME/$SERVICE_NAME"
-else
-    # --- Helm Repository and Execution ---
-    helm repo add --force-update "$HELM_REPO_NAME" "$HELM_REPO_URL" 2>/dev/null || true
-    helm repo update
-    HELM_CHART_PATH="$HELM_REPO_NAME/$SERVICE_NAME"
-fi
-
-
-# Debug output
-echo "[DEBUG] HELM_REPO_URL=$HELM_REPO_URL"
-echo "[DEBUG] HELM_REPO_NAME=$HELM_REPO_NAME"
-echo "[DEBUG] SERVICE_NAME=$SERVICE_NAME"
-echo "[DEBUG] HELM_CHART_PATH=$HELM_CHART_PATH"
-
-# Prepare an array to collect -f arguments
-overrides_args=()
-
-# Include all YAML files from the BASE configuration directory
-# NOTE: Files in this directory are included first.
-if [[ -d "$SERVICE_BASE_OVERRIDES" ]]; then
-    echo "Including base overrides from directory: $SERVICE_BASE_OVERRIDES"
-    for file in "$SERVICE_BASE_OVERRIDES"/*.yaml; do
-        # Check that there is at least one match
-        if [[ -e "$file" ]]; then
-            echo " - $file"
-            overrides_args+=("-f" "$file")
-        fi
-    done
-else
-    echo "Warning: Base override directory not found: $SERVICE_BASE_OVERRIDES"
-fi
-
-# Include all YAML files from the GLOBAL configuration directory
-# NOTE: Files here override base settings and are applied before service-specific ones.
-if [[ -d "$GLOBAL_OVERRIDES_DIR" ]]; then
-    echo "Including global overrides from directory: $GLOBAL_OVERRIDES_DIR"
-    for file in "$GLOBAL_OVERRIDES_DIR"/*.yaml; do
-        if [[ -e "$file" ]]; then
-            echo " - $file"
-            overrides_args+=("-f" "$file")
-        fi
-    done
-else
-    echo "Warning: Global override directory not found: $GLOBAL_OVERRIDES_DIR"
-fi
-
-# Include all YAML files from the custom SERVICE configuration directory
-# NOTE: Files here have the highest precedence.
-if [[ -d "$SERVICE_CUSTOM_OVERRIDES" ]]; then
-    echo "Including overrides from service config directory:"
-    for file in "$SERVICE_CUSTOM_OVERRIDES"/*.yaml; do
-        if [[ -e "$file" ]]; then
-            echo " - $file"
-            overrides_args+=("-f" "$file")
-        fi
-    done
-else
-    echo "Warning: Service config directory not found: $SERVICE_CUSTOM_OVERRIDES"
-fi
-
-echo
+build_helm_args "$SERVICE_NAME_DEFAULT" || exit 1
 
 # Collect all --set arguments (empty for Grafana in the original script)
 # Collect secret-backed --set arguments from bin/services/${SERVICE_NAME_DEFAULT}.yaml.
