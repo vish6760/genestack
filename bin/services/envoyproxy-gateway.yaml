@@ -3,6 +3,7 @@ service:
   name: envoyproxy-gateway
   namespace: envoyproxy-gateway-system
   version: ~
+  family: ""
 
 chart:
   repo_name: envoyproxy-gateway

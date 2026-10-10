@@ -1169,8 +1169,10 @@ resolve_common_family() {
     fi
 }
 
+# Emit source paths on stderr when --log-sources is set; stdout stays YAML.
 load_service_config() {
     local service_name="$1"
+    local log_sources="${2:-}"
     local config_file="${GENESTACK_SERVICES_DIR}/${service_name}.yaml"
     local merge_files=()
 
@@ -1187,7 +1189,7 @@ load_service_config() {
     local override_common_file="${GENESTACK_SERVICE_CONFIG_OVERRIDES_DIR}/${common_name}.yaml"
     local override_service_file="${GENESTACK_SERVICE_CONFIG_OVERRIDES_DIR}/${service_name}.yaml"
 
-    if [[ -f "$common_file" ]]; then
+    if [[ -n "$common_name" && -f "$common_file" ]]; then
         merge_files+=("$common_file")
     fi
 
@@ -1196,8 +1198,13 @@ load_service_config() {
     # Allow runtime overrides to replace chart metadata such as repo_url for
     # air-gapped deployments. Common overrides apply broadly; service-specific
     # overrides win last.
-    [[ -f "$override_common_file" ]] && merge_files+=("$override_common_file")
+    [[ -n "$common_name" && -f "$override_common_file" ]] && merge_files+=("$override_common_file")
     [[ -f "$override_service_file" ]] && merge_files+=("$override_service_file")
+
+    if [[ "$log_sources" == "--log-sources" ]]; then
+        log_info "Service configuration files for ${service_name}:"
+        printf ' - %s\n' "${merge_files[@]}" >&2
+    fi
 
     _merge_configs "${merge_files[@]}"
 }
@@ -1266,7 +1273,7 @@ resolve_service_chart() {
     local config_name="$1"
     local SERVICE_CONFIG HELM_REPO_URL HELM_REPO_NAME SERVICE_NAME
 
-    SERVICE_CONFIG=$(load_service_config "$config_name") || return 1
+    SERVICE_CONFIG=$(load_service_config "$config_name" --log-sources) || return 1
     HELM_REPO_URL=$(yq e '.chart.repo_url // ""' - <<< "$SERVICE_CONFIG") || return 1
     HELM_REPO_NAME=$(yq e '.chart.repo_name // ""' - <<< "$SERVICE_CONFIG") || return 1
     SERVICE_NAME=$(yq e '.chart.service_name // .service.name // ""' - <<< "$SERVICE_CONFIG") || return 1

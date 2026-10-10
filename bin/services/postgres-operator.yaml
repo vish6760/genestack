@@ -3,6 +3,7 @@ service:
   name: postgres-operator
   namespace: postgres-system
   version: ~
+  family: ""
 
 chart:
   repo_name: postgres-operator-charts
