@@ -1202,7 +1202,7 @@ load_service_config() {
     [[ -f "$override_service_file" ]] && merge_files+=("$override_service_file")
 
     if [[ "$log_sources" == "--log-sources" ]]; then
-        log_info "Service configuration files for ${service_name}:"
+        log_info "Including service configuration files for ${service_name}:"
         printf ' - %s\n' "${merge_files[@]}" >&2
     fi
 
@@ -1271,18 +1271,29 @@ resolve_chart_version() {
 
 resolve_service_chart() {
     local config_name="$1"
-    local SERVICE_CONFIG HELM_REPO_URL HELM_REPO_NAME SERVICE_NAME
+    local CHART_SERVICE_CONFIG HELM_REPO_URL HELM_REPO_NAME SERVICE_NAME
 
-    SERVICE_CONFIG=$(load_service_config "$config_name" --log-sources) || return 1
-    HELM_REPO_URL=$(yq e '.chart.repo_url // ""' - <<< "$SERVICE_CONFIG") || return 1
-    HELM_REPO_NAME=$(yq e '.chart.repo_name // ""' - <<< "$SERVICE_CONFIG") || return 1
-    SERVICE_NAME=$(yq e '.chart.service_name // .service.name // ""' - <<< "$SERVICE_CONFIG") || return 1
+    # RESOLVED_* are intentionally global (not local), like HELM_CHART_PATH,
+    # so build_helm_args can reuse the global_overrides decision. Clear them
+    # first so a failed resolve never leaves values from an earlier call.
+    RESOLVED_CONFIG_SERVICE=""
+    RESOLVED_GLOBAL_OVERRIDES=""
+
+    CHART_SERVICE_CONFIG=$(load_service_config "$config_name" --log-sources) || return 1
+    HELM_REPO_URL=$(yq e '.chart.repo_url // ""' - <<< "$CHART_SERVICE_CONFIG") || return 1
+    HELM_REPO_NAME=$(yq e '.chart.repo_name // ""' - <<< "$CHART_SERVICE_CONFIG") || return 1
+    SERVICE_NAME=$(yq e '.chart.service_name // .service.name // ""' - <<< "$CHART_SERVICE_CONFIG") || return 1
+    RESOLVED_GLOBAL_OVERRIDES=$(yq e '.chart.global_overrides' - <<< "$CHART_SERVICE_CONFIG") || return 1
 
     if [[ -z "$SERVICE_NAME" ||
           ( -n "$HELM_REPO_URL" && "$HELM_REPO_URL" != oci://* && -z "$HELM_REPO_NAME" ) ]]; then
         log_error "Incomplete chart metadata for $config_name"
         return 1
     fi
+
+    # Set last: build_helm_args reuses RESOLVED_GLOBAL_OVERRIDES only when
+    # this matches its service name, i.e. only after a successful resolve.
+    RESOLVED_CONFIG_SERVICE="$config_name"
 
     resolve_helm_repo "$HELM_REPO_URL" "$HELM_REPO_NAME" "$SERVICE_NAME"
 }
@@ -1337,13 +1348,19 @@ build_helm_args() {
     local global_dir="${GENESTACK_OVERRIDES_DIR}/helm-configs/global_overrides"
     local custom_dir="${GENESTACK_OVERRIDES_DIR}/helm-configs/${service_name}"
 
-    service_config=$(load_service_config "$service_name") || return 1
-    global_overrides=$(yq e '.chart.global_overrides' - <<< "$service_config") || return 1
+    if [[ -n "${RESOLVED_CONFIG_SERVICE:-}" && "$RESOLVED_CONFIG_SERVICE" == "$service_name" ]]; then
+        # Reuse the setting resolve_service_chart already read.
+        global_overrides="$RESOLVED_GLOBAL_OVERRIDES"
+    else
+        # Called on its own or for another service: read the config directly.
+        service_config=$(load_service_config "$service_name") || return 1
+        global_overrides=$(yq e '.chart.global_overrides' - <<< "$service_config") || return 1
+    fi
 
     overrides_args=()
 
     if [[ -d "$base_dir" ]]; then
-        echo "Including base overrides from directory: $base_dir"
+        echo "[INFO]  Including base overrides from directory: $base_dir"
         for file in "$base_dir"/*.yaml; do
             if [[ -f "$file" ]]; then
                 echo " - $file"
@@ -1366,7 +1383,7 @@ build_helm_args() {
     # As today, an unset flag includes global values; false skips them.
     if [[ "$global_overrides" != "false" ]]; then
         if [[ -d "$global_dir" ]]; then
-            echo "Including global overrides from directory: $global_dir"
+            echo "[INFO]  Including global overrides from directory: $global_dir"
             for file in "$global_dir"/*.yaml; do
                 if [[ -f "$file" ]]; then
                     echo " - $file"
@@ -1379,7 +1396,7 @@ build_helm_args() {
     fi
 
     if [[ -d "$custom_dir" ]]; then
-        echo "Including overrides from service config directory: $custom_dir"
+        echo "[INFO]  Including overrides from service config directory: $custom_dir"
         for file in "$custom_dir"/*.yaml; do
             if [[ -f "$file" ]]; then
                 echo " - $file"
