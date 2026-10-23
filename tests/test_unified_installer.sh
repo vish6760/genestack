@@ -888,7 +888,7 @@ test_manifest_invariants() {
         impacted="$(rotation_collect_impacted_services "$owner" "$ref" | sort -u)"
         while IFS= read -r consumer; do
             [[ -z "$consumer" ]] && continue
-            if [[ " $impacted " != *" $consumer "* ]]; then
+            if ! printf '%s\n' "$impacted" | grep -Fx "$consumer" >/dev/null; then
                 fanout_failures+="${owner}:${ref}:${consumer}"$'\n'
             fi
         done <<< "$(printf '%s\n' "$consumers" | sort -u)"
@@ -1052,9 +1052,13 @@ EOF
     chmod +x "${fakebin}/helm"
 
     PATH="${fakebin}:$PATH" HELM_LOG_FILE="$log_file" helm_install_crds \
-        "synthetic" "synthetic-crds" "1.2.3" "synthetic-repo" "https://example.invalid/charts" "37m"
+        "synthetic" "synthetic-crds" "1.2.3" "synthetic-repo/synthetic" "testing" "37m"
 
-    assert_contains "$(sed -n '3p' "$log_file")" "--timeout 37m" \
+    assert_contains "$(cat "$log_file")" "synthetic-repo/synthetic-crds" \
+        "CRDs should resolve beside the operator chart"
+    assert_contains "$(cat "$log_file")" "--namespace testing" \
+        "CRDs should use the service namespace"
+    assert_contains "$(cat "$log_file")" "--timeout 37m" \
         "CRD installs should honor the resolved Helm timeout"
 }
 
@@ -1226,7 +1230,7 @@ test_post_install_skipped_on_helm_failure() {
             HELM_FAIL_UPGRADE=1 \
             GENESTACK_SERVICES_DIR="${GENESTACK_SERVICES_DIR}" \
         GENESTACK_SKIP_DEFAULT_PASSWORD_SCAN=1 \
-            "${REPO_ROOT}/bin/install.sh" --service longhorn 2>&1 || true
+            "${REPO_ROOT}/bin/install.sh" --service longhorn --version 1.0.0 2>&1 || true
     )"
 
     assert_contains "$install_output" "Skipping post-install hook for 'longhorn' due to Helm failure." \
@@ -1234,6 +1238,240 @@ test_post_install_skipped_on_helm_failure() {
     assert_not_contains "$(cat "$kubectl_log")" "get svc --namespace longhorn-system" \
         "post-install diagnostics should not run after a failed Helm install"
 }
+
+# Isolate configuration fixtures and resolver mocks from the secret tests.
+test_config_layer_precedence() (
+    local root merged sources
+    root="$(mktemp -d)"
+    GENESTACK_SERVICES_DIR="$root/services"
+    GENESTACK_SERVICE_CONFIG_OVERRIDES_DIR="$root/site"
+    mkdir -p "$root/services" "$root/site"
+    cat > "$root/services/openstack-common.yaml" <<'EOF'
+service:
+  namespace: family-default
+chart:
+  repo_url: https://public.example/charts
+  repo_name: public
+  global_overrides: true
+EOF
+    cat > "$root/services/demo.yaml" <<'EOF'
+service:
+  name: demo
+  namespace: service-default
+chart:
+  repo_name: service-default
+  service_name: demo
+EOF
+    cat > "$root/site/openstack-common.yaml" <<'EOF'
+service:
+  namespace: site-family
+chart:
+  repo_name: site-family
+  repo_url: https://internal.example/charts
+  global_overrides: false
+EOF
+    cat > "$root/site/demo.yaml" <<'EOF'
+chart:
+  repo_name: site-service
+EOF
+    merged="$(load_service_config demo --log-sources 2> "$root/sources")"
+    assert_eq site-family "$(printf '%s\n' "$merged" | yq '.service.namespace')" \
+        "site family must override repository service defaults"
+    assert_eq site-service "$(printf '%s\n' "$merged" | yq '.chart.repo_name')" \
+        "site service must override site family"
+    assert_eq false "$(printf '%s\n' "$merged" | yq '.chart.global_overrides')" \
+        "false must survive the configuration merge"
+    sources="$(sed -n 's/^ - //p' "$root/sources")"
+    assert_eq "$(printf '%s\n' "$root/services/openstack-common.yaml" "$root/services/demo.yaml" "$root/site/openstack-common.yaml" "$root/site/demo.yaml")" \
+        "$sources" "configuration sources must be reported in merge order"
+
+    printf 'service:\n  family: ""\n  name: standalone\n' > "$root/services/standalone.yaml"
+    printf 'chart: {repo_url: accidental}\n' > "$root/site/.yaml"
+    merged="$(load_service_config standalone)"
+    assert_eq null "$(printf '%s\n' "$merged" | yq '.chart.repo_url')" \
+        "explicit empty family must skip all family files"
+)
+
+test_values_precedence_and_chart_rename() (
+    local root config actual expected file diagnostics
+    root="$(mktemp -d)"
+    GENESTACK_BASE_DIR="$root/base"
+    GENESTACK_OVERRIDES_DIR="$root/site"
+    mkdir -p "$root/base/base-helm-configs/renamed-chart" \
+        "$root/site/helm-configs/global_overrides" "$root/site/helm-configs/renamed-chart" \
+        "$root/site/service-configs"
+    local files=(
+        "$root/base/base-helm-configs/renamed-chart/10-base.yaml"
+        "$root/base/base-helm-configs/renamed-chart/20-storage settings.yaml"
+        "$root/site/helm-configs/global_overrides/global.yaml"
+        "$root/site/helm-configs/renamed-chart/service.yaml"
+    )
+    for file in "${files[@]}"; do printf '{}\n' > "$file"; done
+    printf 'chart: {repo_url: https://metadata.example}\n' > "$root/site/service-configs/demo.yaml"
+    config='service:
+  name: demo
+chart:
+  service_name: renamed-chart
+  global_overrides: true'
+    actual="$(build_helm_args "$config" 2> "$root/values.log")"
+    expected="$(printf '%s\n' "${files[@]}" | while IFS= read -r file; do printf '%s\n' '-f' "$file"; done)"
+    assert_eq "$expected" "$actual" "values must retain chart-name directories, base/global/service order, and spaces"
+    diagnostics="$(cat "$root/values.log")"
+    expected="$(printf '%s\n' \
+        "[INFO]  Including base overrides from directory: $root/base/base-helm-configs/renamed-chart" \
+        " - ${files[0]}" " - ${files[1]}" \
+        "[INFO]  Including global overrides from directory: $root/site/helm-configs/global_overrides" \
+        " - ${files[2]}" \
+        "[INFO]  Including overrides from service config directory: $root/site/helm-configs/renamed-chart" \
+        " - ${files[3]}")"
+    assert_eq "$expected" "$diagnostics" "values diagnostics must match loading order on stderr without changing Helm arguments"
+    actual="$(build_helm_args "$(printf '%s\n' "$config" | yq '.chart.global_overrides = false')" 2> "$root/values.log")"
+    assert_not_contains "$actual" global_overrides "false must exclude global values"
+    assert_not_contains "$(cat "$root/values.log")" global_overrides "disabled global values must not be logged as included"
+    assert_contains "$actual" "$root/site/helm-configs/renamed-chart/service.yaml" "service values must still apply"
+    assert_not_contains "$actual" service-configs "chart metadata must never become Helm values"
+
+    # Explicit nested files are inserted before site values, in caller order.
+    local additional_base_values=(
+        "$root/base/base-helm-configs/renamed-chart/ssl/20-tls settings.yaml"
+        "$root/base/base-helm-configs/renamed-chart/rules/10-rules.yaml"
+    )
+    mkdir -p "${additional_base_values[0]%/*}" "${additional_base_values[1]%/*}"
+    for file in "${additional_base_values[@]}"; do printf '{}\n' > "$file"; done
+    actual="$(build_helm_args "$config" "${additional_base_values[@]}" 2> "$root/values.log")"
+    expected="$(printf '%s\n' "${files[0]}" "${files[1]}" "${additional_base_values[@]}" "${files[2]}" "${files[3]}" |
+        while IFS= read -r file; do printf '%s\n' '-f' "$file"; done)"
+    assert_eq "$expected" "$actual" "additional base files must preserve caller order, spaces, and site override precedence"
+    diagnostics="$(sed -n 's/^ - //p' "$root/values.log")"
+    assert_eq "$(printf '%s\n' "${files[0]}" "${files[1]}" "${additional_base_values[@]}" "${files[2]}" "${files[3]}")" \
+        "$diagnostics" "additional values diagnostics must match argument order"
+    assert_contains "$(cat "$root/values.log")" 'Including additional base overrides:' "additional values must have a log heading"
+
+    actual="$(build_helm_args "$(printf '%s\n' "$config" | yq '.chart.global_overrides = false')" "${additional_base_values[@]}" 2> "$root/values.log")"
+    expected="$(printf '%s\n' "${files[0]}" "${files[1]}" "${additional_base_values[@]}" "${files[3]}" |
+        while IFS= read -r file; do printf '%s\n' '-f' "$file"; done)"
+    assert_eq "$expected" "$actual" "disabled globals must preserve additional base files and service overrides"
+    assert_not_contains "$(cat "$root/values.log")" global_overrides "disabled global values must not be logged with additional files"
+
+    additional_base_values=()
+    actual="$(build_helm_args "$config" "${additional_base_values[@]}" 2> "$root/values.log")"
+    expected="$(printf '%s\n' "${files[@]}" | while IFS= read -r file; do printf '%s\n' '-f' "$file"; done)"
+    assert_eq "$expected" "$actual" "empty additional file lists must retain existing behavior and skip nested files"
+    assert_not_contains "$(cat "$root/values.log")" 'additional base overrides' "empty additional file lists must not print an inclusion heading"
+
+    if actual="$(build_helm_args "$config" "${files[0]}" "$root/missing.yaml" 2> "$root/values.log")"; then
+        fail "an explicitly selected missing file must stop values collection"
+    fi
+    assert_eq '' "$actual" "missing explicit files must fail before emitting partial Helm arguments"
+    assert_contains "$(cat "$root/values.log")" "$root/missing.yaml" "missing-file errors must identify the selected path"
+)
+
+test_site_chart_sources_and_versions() (
+    local root source chart command
+    root="$(mktemp -d)"
+    export GENESTACK_BASE_DIR="$root/base" GENESTACK_OVERRIDES_DIR="$root/site"
+    export GENESTACK_SERVICES_DIR="$root/services"
+    export GENESTACK_SERVICE_CONFIG_OVERRIDES_DIR="$root/site/service-configs"
+    export HELM_LOG_FILE="$root/helm.log" KUBECTL_LOG_FILE="$root/kubectl.log"
+    export GENESTACK_SKIP_DEFAULT_PASSWORD_SCAN=1 KUBECTL_BIN=kubectl
+    mkdir -p "$root/bin" "$root/services" "$root/site/service-configs" \
+        "$root/base/base-helm-configs/demo" "$root/base/base-helm-configs/renamed" \
+        "$root/base/base-helm-configs/demo-crds" "$root/site/helm-configs/renamed" \
+        "$root/site/helm-configs/global_overrides"
+    create_fake_installer_binaries "$root/bin"
+    export PATH="$root/bin:$PATH"
+    printf '{}\n' > "$root/base/base-helm-configs/renamed/base.yaml"
+    printf '{}\n' > "$root/site/helm-configs/renamed/site.yaml"
+    printf '{}\n' > "$root/site/helm-configs/global_overrides/global.yaml"
+    cat > "$root/services/demo.yaml" <<'EOF'
+service:
+  name: demo
+  namespace: testing
+  family: ""
+chart:
+  repo_url: https://public.example/charts
+  repo_name: public
+  service_name: demo
+  global_overrides: true
+crd_chart: demo-crds
+secrets: []
+EOF
+    printf 'charts: {demo: 1.0.0, renamed: 0.9.0}\n' > "$root/site/helm-chart-versions.yaml"
+    for source in http oci local; do
+        case "$source" in
+            http) chart=internal/renamed
+                printf 'chart:\n  repo_url: https://internal.example/charts\n  repo_name: internal\n' > "$root/site/service-configs/demo.yaml" ;;
+            oci) chart=oci://registry.example/charts/renamed
+                printf 'chart:\n  repo_url: oci://registry.example/charts/renamed\n' > "$root/site/service-configs/demo.yaml" ;;
+            local) chart="$root/base/base-helm-configs/renamed"
+                printf 'chart:\n  repo_url: null\n  repo_name: null\n' > "$root/site/service-configs/demo.yaml" ;;
+        esac
+        printf '  service_name: renamed\n  global_overrides: false\nservice:\n  version: 2.0.0\n' >> "$root/site/service-configs/demo.yaml"
+        : > "$HELM_LOG_FILE"
+        "${REPO_ROOT}/bin/install.sh" --service demo --dry-run > "$root/output" 2>&1 \
+            || fail "$source chart install failed: $(cat "$root/output")"
+        command="$(grep '^upgrade --install demo ' "$HELM_LOG_FILE")"
+        assert_contains "$command" "demo $chart --version=2.0.0" "$source must use the site chart and version"
+        assert_contains "$command" "-f $root/base/base-helm-configs/renamed/base.yaml -f $root/site/helm-configs/renamed/site.yaml" \
+            "$source must retain existing chart-name values paths"
+        assert_not_contains "$command" global_overrides "$source must honor disabled global overrides"
+        assert_not_contains "$command" service-configs "$source metadata must not be passed with -f"
+        assert_contains "$(cat "$HELM_LOG_FILE")" "upgrade --install demo-crds ${chart%/*}/demo-crds" \
+            "$source CRD chart must follow the selected source"
+        if [[ "$source" == http ]]; then
+            assert_contains "$(cat "$HELM_LOG_FILE")" 'repo add --force-update internal https://internal.example/charts' \
+                "HTTP must register the internal repository"
+        else
+            assert_not_contains "$(cat "$HELM_LOG_FILE")" 'repo ' "$source must not use HTTP repository setup"
+        fi
+    done
+    : > "$HELM_LOG_FILE"
+    "${REPO_ROOT}/bin/install.sh" --service demo --version 3.0.0 --dry-run > "$root/output" 2>&1
+    assert_contains "$(cat "$HELM_LOG_FILE")" --version=3.0.0 "CLI version must win over the site pin"
+
+    # Remove the site pin to exercise manifest lookup and strict failures.
+    yq -i 'del(.service.version)' "$root/site/service-configs/demo.yaml"
+    "${REPO_ROOT}/bin/install.sh" --service demo --dry-run > "$root/output" 2>&1
+    assert_contains "$(tail -n1 "$HELM_LOG_FILE")" --version=1.0.0 "manifest service key must win over the chart key"
+    printf 'charts: {renamed: 0.9.0}\n' > "$root/site/helm-chart-versions.yaml"
+    "${REPO_ROOT}/bin/install.sh" --service demo --dry-run > "$root/output" 2>&1
+    assert_contains "$(tail -n1 "$HELM_LOG_FILE")" --version=0.9.0 "manifest chart-name fallback must still work"
+
+    for source in missing-entry missing-file; do
+        if [[ "$source" == missing-entry ]]; then
+            printf 'charts: {}\n' > "$root/site/helm-chart-versions.yaml"
+        else
+            mv "$root/site/helm-chart-versions.yaml" "$root/saved-versions.yaml"
+        fi
+        : > "$HELM_LOG_FILE"
+        : > "$KUBECTL_LOG_FILE"
+        if "${REPO_ROOT}/bin/install.sh" --service demo > "$root/output" 2>&1; then
+            fail "$source must stop installation"
+        fi
+        assert_eq '' "$(cat "$HELM_LOG_FILE" "$KUBECTL_LOG_FILE")" \
+            "$source must fail before Helm or cluster changes"
+    done
+)
+
+test_chart_resolution_failures() (
+    local root
+    root="$(mktemp -d)"
+    GENESTACK_BASE_DIR="$root"
+    if resolve_helm_repo '' '' absent >/dev/null 2>&1; then
+        fail "missing local chart must stop resolution"
+    fi
+    assert_eq '' "$HELM_CHART_PATH" "failed resolution must clear stale chart paths"
+    if resolve_helm_repo https://internal.example/charts '' demo >/dev/null 2>&1; then
+        fail "HTTP chart metadata must include a repository alias"
+    fi
+    helm() { return 1; }
+    if resolve_helm_repo https://internal.example/charts internal demo >/dev/null 2>&1; then
+        fail "repository registration failures must propagate"
+    fi
+    if helm_install_crds demo demo-crds 1.0.0 "$root/demo" testing 5m >/dev/null 2>&1; then
+        fail "missing local CRD chart must fail"
+    fi
+)
 
 main() {
     local tmp_root
@@ -1245,6 +1483,10 @@ main() {
     test_secret_arg_token_parser
     test_base64_encode_helper
     test_service_config_repo_url_overrides
+    test_config_layer_precedence
+    test_values_precedence_and_chart_rename
+    test_site_chart_sources_and_versions
+    test_chart_resolution_failures
     test_build_post_renderer_args_tokenization
     test_final_helm_command_construction
     test_multi_chart_install_reuses_secret_pipeline
