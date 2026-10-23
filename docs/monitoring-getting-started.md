@@ -165,11 +165,7 @@ curl http://127.0.0.1:3200/ready
 
 Grafana uses `/etc/genestack/helm-configs/grafana/` for service overrides. Set `custom_host` there if you are publishing Grafana through an ingress or gateway.
 
-<<<<<<< HEAD
-The Grafana installer ensures the `grafana-db` secret exists in `monitoring` before deploying the chart.
-=======
 The Grafana installer ensures the `grafana-db` secret exists in `monitoring`.
->>>>>>> feat: Migrating observability to its own repo, retain observability installers
 
 Install Grafana:
 
